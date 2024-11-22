@@ -46,29 +46,36 @@ async function ensureImageExists(imageName) {
 let clients = [];
 
 function eventsHandler(request, response, next) {
+    const appName = request.params.appName;
     const headers = {
         'Content-Type': 'text/event-stream', 'Connection': 'keep-alive', 'Cache-Control': 'no-cache'
     };
     response.writeHead(200, headers);
+    response.write(`data: "StartEvent"\n\n`);
 
-    const clientId = Date.now();
+    // const clientId = Math.random().toString(36).substring(7);
 
     const newClient = {
-        id: clientId, response
+        id: appName, response
     };
 
     clients.push(newClient);
 
     request.on('close', () => {
-        console.log(`${clientId} Connection closed`);
-        clients = clients.filter(client => client.id !== clientId);
+        console.log(`${appName} Connection closed`);
+        clients = clients.filter(client => client.id !== appName);
     });
 }
 
-app.get('/events', eventsHandler);
+app.get('/events/:appName', eventsHandler);
 
 function sendEventsToAll(newFact) {
     clients.forEach(client => client.response.write(`data: ${JSON.stringify(newFact)}\n\n`))
+}
+
+function sendEventsToOne(appName, message) {
+    const client = clients.find(client => client.id === appName);
+    client.response.write(`data: ${JSON.stringify(message)}\n\n`);
 }
 
 app.post('/create-react-app', async (req, res) => {
@@ -88,12 +95,12 @@ app.post('/create-react-app', async (req, res) => {
         const imageName = 'node:18-alpine';
 
         // Step 1: Ensure the Docker image exists
-        sendEventsToAll(`data: Ensuring Docker image ${imageName} is available...`);
+        sendEventsToOne(appName, `Ensuring Docker image ${imageName} is available...`);
         await ensureImageExists(imageName);
-        sendEventsToAll(`data: Docker image ${imageName} is ready.`);
+        sendEventsToOne(appName, `Docker image ${imageName} is ready.`);
 
         // Step 2: Start building the React app
-        sendEventsToAll(`data: Creating React app: ${appName}...`);
+        sendEventsToOne(appName, `Creating React app: ${appName}...`);
         fs.ensureDirSync(appDir);
 
         const commands = [`npm i -g create-react-app`, `npx create-react-app ${appName}`, `cd ${appName} && npm run build`, `cp -r build /output`,].join(' && ');
@@ -104,40 +111,35 @@ app.post('/create-react-app', async (req, res) => {
             },
         });
         res.status(200).json({
-            message: 'React app creating',
-            data: container?.data || {}
+            message: 'React app creating', data: container?.data || {}
         });
         await container.start();
 
         // Stream logs from the container
-        sendEventsToAll(`data: Building the React app. Logs:`);
+        sendEventsToOne(appName, `Building the React app. Logs:`);
         const logsStream = await container.logs({
             follow: true, stdout: true, stderr: true,
         });
 
         logsStream.on('data', (chunk) => {
-            sendEventsToAll(chunk.toString());
+            sendEventsToOne(appName, chunk.toString());
         });
 
         const interval = setInterval(() => {
-            sendEventsToAll(`data: Building....`);
-        }, 2000)
+            sendEventsToOne(appName, `Building....`);
+        }, 5000)
         await container.wait();
-        // await container.remove();
+        await container.remove();
 
         clearInterval(interval)
         // Step 4: Completion message
 
 
-        sendEventsToAll(`data: React app ${appName} created and built successfully.`);
-        sendEventsToAll(`data: React app ${appName} creation started. Follow progress via /events/${appName}`);
+        sendEventsToOne(appName, `React app ${appName} created and built successfully.`);
+        sendEventsToOne(appName, `CloseEvent`);
         console.log("App build successfully.");
     } catch (error) {
         console.error('Error creating React app:', error.message);
-        const sendEvent = clients.get(appName);
-        if (sendEvent) {
-            sendEvent({error: error.message});
-        }
         res.status(500).json({error: error.message});
     }
 });
