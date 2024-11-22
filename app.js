@@ -3,6 +3,11 @@ const Docker = require('dockerode');
 const fs = require('fs-extra');
 const path = require('path');
 const cors = require("cors");
+const stripAnsi = require('strip-ansi');
+const {uploadToMinIo} = require("./minio");
+const util = require("node:util");
+const e = require("express");
+
 
 const app = express();
 const docker = new Docker({socketPath: '/var/run/docker.sock'});
@@ -10,6 +15,8 @@ const docker = new Docker({socketPath: '/var/run/docker.sock'});
 
 app.use(cors({origin: "http://localhost:5173"}));
 app.use(express.json());
+
+app.use('/builds', express.static(path.join(__dirname, 'react-builds')));
 
 const BASE_HOST_DIR = path.join(__dirname, 'react-builds'); // Host directory to store React app builds
 fs.ensureDirSync(BASE_HOST_DIR);
@@ -101,28 +108,33 @@ app.post('/create-react-app', async (req, res) => {
 
         // Step 2: Start building the React app
         sendEventsToOne(appName, `Creating React app: ${appName}...`);
-        fs.ensureDirSync(appDir);
+        // fs.ensureDirSync(appDir);
 
-        const commands = [`npm i -g create-react-app`, `npx create-react-app ${appName}`, `cd ${appName} && npm run build`, `cp -r build /output`,].join(' && ');
+        // const commands = [`npm i -g create-react-app`, `npx create-react-app ${appName}`, `cd ${appName} && npm run build`, `cp -r build /output`,].join(' && ');
+        const commands = [`CI=true npm create vite@latest ${appName} -- --template react`, `cd ${appName}`, `tar -czvf ${appName}.tar.gz .`, `cp ${appName}.tar.gz /output`,]
+            .join(' && ');
 
         const container = await docker.createContainer({
             Image: imageName, Tty: true, Cmd: ['sh', '-c', commands], HostConfig: {
-                Binds: [`${appDir}:/output`],
-            },
+                Binds: [`${BASE_HOST_DIR}:/output`],
+            }
         });
         res.status(200).json({
             message: 'React app creating', data: container?.data || {}
         });
         await container.start();
 
-        // Stream logs from the container
+// Stream logs from the container
         sendEventsToOne(appName, `Building the React app. Logs:`);
         const logsStream = await container.logs({
             follow: true, stdout: true, stderr: true,
         });
 
+
         logsStream.on('data', (chunk) => {
-            sendEventsToOne(appName, chunk.toString());
+            let log = stripAnsi(chunk.toString()); // Remove ANSI escape codes
+            log = log.replace(/[\r\n|/-\\]+/g, ''); // Remove spinner artifacts and redundant newlines
+            sendEventsToOne(appName, log.trim());
         });
 
         const interval = setInterval(() => {
@@ -132,12 +144,27 @@ app.post('/create-react-app', async (req, res) => {
         await container.remove();
 
         clearInterval(interval)
-        // Step 4: Completion message
+// Step 4: Completion message
 
 
         sendEventsToOne(appName, `React app ${appName} created and built successfully.`);
+
+        const uploadPromise = util.promisify(uploadToMinIo)
+        try {
+            sendEventsToOne(appName, `Uploading to S3`);
+            const {url} = await uploadPromise(appName)
+            sendEventsToOne(appName, `Uploaded`);
+            sendEventsToOne(appName, `Local URL: http://localhost:3000/builds/${appName}.tar.gz`);
+            sendEventsToOne(appName, `S3 URL: ${url}`);
+            fs.removeSync(`${appDir}.tar.gz`);
+
+        } catch (e) {
+            sendEventsToOne(appName, e.message);
+
+        }
+
         sendEventsToOne(appName, `CloseEvent`);
-        console.log("App build successfully.");
+        console.log("Done bye bye.");
     } catch (error) {
         console.error('Error creating React app:', error.message);
         res.status(500).json({error: error.message});
